@@ -1,8 +1,8 @@
 app_name = "denfab_customisations"
 app_title = "Denfab Customisations"
-app_publisher = "Denfab"
+app_publisher = "Hybrowlabs"
 app_description = "Customisations for Denfab"
-app_email = "info@denfab.com"
+app_email = "prathamesh.j@hybrowlabs.com"
 app_license = "mit"
 
 # Apps
@@ -148,23 +148,13 @@ app_license = "mit"
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"denfab_customisations.tasks.all"
-# 	],
-# 	"daily": [
-# 		"denfab_customisations.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"denfab_customisations.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"denfab_customisations.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"denfab_customisations.tasks.monthly"
-# 	],
-# }
+scheduler_events = {
+	"cron": {
+		"0 4 * * *": [
+			"denfab_customisations.tasks.deduct_leave_for_late_entries"
+		]
+	}
+}
 
 # Testing
 # -------
