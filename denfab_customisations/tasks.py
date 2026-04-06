@@ -2,26 +2,25 @@ import frappe
 from frappe.utils import getdate, get_first_day, today
 
 # --- Configuration ---
-LATE_ENTRY_LEAVE_TYPE = "Casual Leave"  # Leave type to deduct from
-LATE_ENTRY_FREE_QUOTA = 3               # First N late entries are acceptable
-LATE_ENTRY_DEDUCTION_INTERVAL = 3       # Deduct 1 leave per N late entries after quota
+LATE_ENTRY_FREE_QUOTA = 3          # First N late entries are acceptable
+LATE_ENTRY_DEDUCTION_INTERVAL = 3  # Add 1 LWP per N late entries after quota
 # ----------------------
 
 
 def deduct_leave_for_late_entries():
 	"""
-	Daily scheduler (4 AM): Deduct leaves from Leave Allocation for excessive late entries.
+	Daily scheduler (4 AM): Add Leave Without Pay for excessive late entries.
 
 	Rule:
 	  - First 3 late entries in the month are free.
-	  - For every 3rd late entry beyond that, deduct 1 leave day.
+	  - For every 3rd late entry beyond that, add 1 Leave Without Pay.
 
 	Examples:
-	  3 late entries  → 0 deductions
-	  4, 5 late       → 0 deductions  (not yet 3 after quota)
-	  6 late          → 1 deduction
-	  9 late          → 2 deductions
-	  12 late         → 3 deductions
+	  3 late entries  → 0 LWP
+	  4, 5 late       → 0 LWP
+	  6 late          → 1 LWP
+	  9 late          → 2 LWP
+	  12 late         → 3 LWP
 	"""
 	today_date = getdate(today())
 	from_date = get_first_day(today_date)
@@ -52,43 +51,39 @@ def deduct_leave_for_late_entries():
 		if row.late_count <= LATE_ENTRY_FREE_QUOTA:
 			continue
 
-		deductions_needed = (row.late_count - LATE_ENTRY_FREE_QUOTA) // LATE_ENTRY_DEDUCTION_INTERVAL
-		if deductions_needed <= 0:
+		lwp_needed = (row.late_count - LATE_ENTRY_FREE_QUOTA) // LATE_ENTRY_DEDUCTION_INTERVAL
+		if lwp_needed <= 0:
 			continue
 
-		# Count auto-deduction ledger entries already created for this employee this month.
-		# These are negative, non-expiry entries against Leave Allocation — not created in
-		# normal ERPNext flow — so counting them is a reliable idempotency guard.
-		existing_deductions = frappe.db.count(
-			"Leave Ledger Entry",
+		marker = f"[AUTO-LATE-DEDUCT:{month_key}]"
+
+		existing = frappe.db.count(
+			"Leave Application",
 			filters={
 				"employee": row.employee,
-				"leave_type": LATE_ENTRY_LEAVE_TYPE,
-				"transaction_type": "Leave Allocation",
-				"leaves": ["<", 0],
-				"is_expired": 0,
-				"from_date": ["between", [from_date, to_date]],
-				"docstatus": 1,
+				"description": ["like", f"%{marker}%"],
+				"docstatus": 1,  # only count successfully submitted ones
 			},
 		)
 
-		leaves_to_deduct = deductions_needed - existing_deductions
-		if leaves_to_deduct <= 0:
+		to_create = lwp_needed - existing
+		if to_create <= 0:
 			continue
 
 		frappe.logger().info(
 			f"[Late Entry Deduction] {row.employee_name} ({row.employee}): "
-			f"{row.late_count} late entries → {deductions_needed} deductions needed, "
-			f"{existing_deductions} already done, deducting {leaves_to_deduct}"
+			f"{row.late_count} late entries → {lwp_needed} LWP needed, "
+			f"{existing} already done, creating {to_create}"
 		)
 
-		for _ in range(leaves_to_deduct):
+		for _ in range(to_create):
 			try:
-				_deduct_from_leave_allocation(
+				_create_lwp_application(
 					employee=row.employee,
-					employee_name=row.employee_name,
 					deduction_date=to_date,
 					month_key=month_key,
+					marker=marker,
+					late_count=row.late_count,
 				)
 				frappe.db.commit()
 			except Exception:
@@ -99,45 +94,29 @@ def deduct_leave_for_late_entries():
 				frappe.db.rollback()
 
 
-def _deduct_from_leave_allocation(employee, employee_name, deduction_date, month_key):
-	"""Deduct 1 leave directly from the active Leave Allocation via Leave Ledger Entry."""
-	allocation = frappe.db.get_value(
-		"Leave Allocation",
-		filters={
-			"employee": employee,
-			"leave_type": LATE_ENTRY_LEAVE_TYPE,
-			"from_date": ["<=", deduction_date],
-			"to_date": [">=", deduction_date],
-			"docstatus": 1,
-		},
-		fieldname=["name", "employee_name"],
-		as_dict=True,
+def _create_lwp_application(employee, deduction_date, month_key, marker, late_count):
+	"""Create and submit a Leave Without Pay application for late-entry deduction."""
+	la = frappe.new_doc("Leave Application")
+	la.employee = employee
+	la.leave_type = "Leave Without Pay"
+	la.from_date = deduction_date
+	la.to_date = deduction_date
+	la.total_leave_days = 1
+	la.status = "Approved"
+	la.description = (
+		f"{marker} Leave Without Pay auto-applied for excessive late entries in {month_key}. "
+		f"Employee had {late_count} late entries "
+		f"(first {LATE_ENTRY_FREE_QUOTA} are free; "
+		f"1 LWP added per {LATE_ENTRY_DEDUCTION_INTERVAL} late entries thereafter)."
 	)
-
-	if not allocation:
-		frappe.log_error(
-			f"No active '{LATE_ENTRY_LEAVE_TYPE}' allocation found for {employee} on {deduction_date}. "
-			f"Could not deduct leave for late entries in {month_key}.",
-			"Late Entry Leave Deduction",
-		)
-		return
-
-	ledger = frappe.new_doc("Leave Ledger Entry")
-	ledger.employee = employee
-	ledger.employee_name = allocation.employee_name or employee_name
-	ledger.leave_type = LATE_ENTRY_LEAVE_TYPE
-	ledger.transaction_type = "Leave Allocation"
-	ledger.transaction_name = allocation.name
-	ledger.from_date = deduction_date
-	ledger.to_date = deduction_date
-	ledger.leaves = -1
-	ledger.is_carry_forward = 0
-	ledger.is_expired = 0
-	ledger.is_lwp = 0
-	ledger.flags.ignore_permissions = True
-	ledger.submit()
-
-	frappe.logger().info(
-		f"[Late Entry Deduction] Deducted 1 leave from allocation {allocation.name} "
-		f"for {employee} ({month_key})"
-	)
+	la.flags.ignore_permissions = True
+	la.flags.ignore_validate = True
+	la.insert()
+	# in_patch suppresses the "Holiday List not set" error in create_leave_ledger_entry
+	# since this is a system-automated deduction, not a user-initiated leave request
+	_prev = frappe.flags.in_patch
+	frappe.flags.in_patch = True
+	try:
+		la.submit()
+	finally:
+		frappe.flags.in_patch = _prev
